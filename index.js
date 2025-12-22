@@ -271,7 +271,7 @@ app.post('/api/issues', authenticateToken, authorizeRole('citizen'), async (req,
                     updatedBy: req.user.email,
                     updatedByRole: 'citizen',
                     timestamp: new Date(),
-                    comment: 'Issue reported by citizen'
+                    comment: req.user.isPremium ? 'Priority Issue reported by Premium Citizen' : 'Issue reported by citizen'
                 }
             ],
             createdAt: new Date(),
@@ -391,6 +391,22 @@ app.put('/api/issues/:id/upvote', authenticateToken, async (req, res) => {
             }
         );
 
+        // Create timeline entry for Boost
+        await db.collection('issues').updateOne(
+            { _id: new ObjectId(issueId) },
+            {
+                $push: {
+                    statusHistory: {
+                        status: 'boosted',
+                        updatedBy: req.user.email,
+                        updatedByRole: req.user.role,
+                        timestamp: new Date(),
+                        comment: 'Issue boosted! Priority increased.'
+                    }
+                }
+            }
+        );
+
         res.json({ message: 'Upvoted successfully', upvotes: (issue.upvotes || 0) + 1 });
 
     } catch (error) {
@@ -462,7 +478,7 @@ app.patch('/api/issues/:id/status', authenticateToken, authorizeRole('staff', 'a
         }
 
         const { status, comment } = req.body;
-        const validStatuses = ['pending', 'assigned', 'in-progress', 'resolved', 'closed'];
+        const validStatuses = ['pending', 'assigned', 'in-progress', 'resolved', 'closed', 'rejected'];
 
         if (!status || !validStatuses.includes(status)) {
             return res.status(400).json({ message: 'Valid status is required' });
