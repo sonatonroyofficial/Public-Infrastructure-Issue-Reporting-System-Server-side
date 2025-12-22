@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { MongoClient, ObjectId } from 'mongodb';
+import { MongoClient, ObjectId, ServerApiVersion } from 'mongodb';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
@@ -18,17 +18,29 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // MongoDB Connection
 const uri = process.env.MONGODB_URI;
-const client = new MongoClient(uri);
+
+// Create a MongoClient with a MongoClientOptions object to set the Stable API version
+const client = new MongoClient(uri, {
+    serverApi: {
+        version: ServerApiVersion.v1,
+        strict: true,
+        deprecationErrors: true,
+    }
+});
 
 let db;
 let dbConnected = false;
 
 async function connectToDatabase() {
     try {
+        // Connect the client to the server
         await client.connect();
+        // Send a ping to confirm a successful connection
+        await client.db("admin").command({ ping: 1 });
+
         db = client.db('infrastructure_reporting');
         dbConnected = true;
-        console.log('✅ Connected to MongoDB successfully');
+        console.log("Pinged your deployment. You successfully connected to MongoDB!");
 
         // Create indexes for better performance
         await db.collection('users').createIndex({ email: 1 }, { unique: true });
