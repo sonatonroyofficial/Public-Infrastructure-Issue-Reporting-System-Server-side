@@ -50,6 +50,8 @@ async function connectToDatabase() {
     } catch (error) {
         console.error('❌ MongoDB connection error:', error);
         dbConnected = false;
+        console.log("Retrying connection in 5 seconds...");
+        setTimeout(connectToDatabase, 5000);
     }
 }
 
@@ -117,6 +119,7 @@ app.post('/api/auth/register', async (req, res) => {
             address: address || '',
             role, // citizen, staff, admin
             isPremium: role === 'citizen' ? isPremium : false,
+            isBlocked: false,
             createdAt: new Date(),
             updatedAt: new Date()
         };
@@ -197,7 +200,9 @@ app.post('/api/auth/login', async (req, res) => {
                 name: user.name,
                 email: user.email,
                 role: user.role,
+                role: user.role,
                 isPremium: user.isPremium || false,
+                isBlocked: user.isBlocked || false,
                 phone: user.phone,
                 address: user.address
             }
@@ -271,6 +276,24 @@ app.post('/api/issues', authenticateToken, authorizeRole('citizen'), async (req,
         }
 
         const { title, description, category, location, photos } = req.body;
+
+        // Check if user is blocked or has reached limit
+        const user = await db.collection('users').findOne({ _id: new ObjectId(req.user.userId) });
+
+        if (user?.isBlocked) {
+            return res.status(403).json({ message: 'Your account is blocked. You cannot submit issues.' });
+        }
+
+        // Check limit for free users
+        if (!user?.isPremium && user?.role === 'citizen') {
+            const issueCount = await db.collection('issues').countDocuments({ citizenId: new ObjectId(req.user.userId) });
+            if (issueCount >= 3) {
+                return res.status(403).json({
+                    message: 'Free users can only report 3 issues. Please upgrade to Premium for unlimited reporting.',
+                    requiresUpgrade: true
+                });
+            }
+        }
 
         if (!title || !description || !category || !location) {
             return res.status(400).json({ message: 'Title, description, category, and location are required' });
@@ -393,6 +416,12 @@ app.put('/api/issues/:id/upvote', authenticateToken, async (req, res) => {
             return res.status(503).json({ message: 'Database not connected' });
         }
 
+        // Check if user is blocked
+        const user = await db.collection('users').findOne({ _id: new ObjectId(req.user.userId) });
+        if (user?.isBlocked) {
+            return res.status(403).json({ message: 'Your account is blocked. You cannot upvote.' });
+        }
+
         const issueId = req.params.id;
         const userId = req.user.userId;
 
@@ -441,6 +470,41 @@ app.put('/api/issues/:id/upvote', authenticateToken, async (req, res) => {
 
     } catch (error) {
         console.error('Upvote error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+
+
+// Subscribe / Payment Endpoint (Mock)
+app.post('/api/payment/subscribe', authenticateToken, async (req, res) => {
+    try {
+        if (!dbConnected) {
+            return res.status(503).json({ message: 'Database not connected' });
+        }
+
+        // In a real app, verify Stripe/Payment gateway here
+        // For now, we instantly upgrade the user
+        const { amount } = req.body;
+
+        if (amount < 1000) {
+            return res.status(400).json({ message: 'Invalid amount. Subscription costs 1000tk.' });
+        }
+
+        await db.collection('users').updateOne(
+            { _id: new ObjectId(req.user.userId) },
+            {
+                $set: {
+                    isPremium: true,
+                    updatedAt: new Date()
+                }
+            }
+        );
+
+        res.json({ message: 'Subscription successful! You are now a Premium user.' });
+
+    } catch (error) {
+        console.error('Payment error:', error);
         res.status(500).json({ message: 'Server error' });
     }
 });
@@ -508,10 +572,9 @@ app.patch('/api/issues/:id/status', authenticateToken, authorizeRole('staff', 'a
         }
 
         const { status, comment } = req.body;
-        const validStatuses = ['pending', 'assigned', 'in-progress', 'resolved', 'closed', 'rejected'];
-
-        if (!status || !validStatuses.includes(status)) {
-            return res.status(400).json({ message: 'Valid status is required' });
+        const validStatuses = ['pending', 'assigned', 'in-progress', 'working', 'resolved', 'closed', 'rejected'];
+        if (!validStatuses.includes(status)) {
+            return res.status(400).json({ message: 'Invalid status' });
         }
 
         const issue = await db.collection('issues').findOne({ _id: new ObjectId(req.params.id) });
@@ -610,6 +673,12 @@ app.put('/api/issues/:id', authenticateToken, authorizeRole('citizen'), async (r
             return res.status(404).json({ message: 'Issue not found' });
         }
 
+        // Check if user is blocked
+        const user = await db.collection('users').findOne({ _id: new ObjectId(req.user.userId) });
+        if (user?.isBlocked) {
+            return res.status(403).json({ message: 'Your account is blocked. You cannot edit issues.' });
+        }
+
         // Verify ownership
         if (issue.citizenId.toString() !== req.user.userId) {
             return res.status(403).json({ message: 'You can only edit your own issues' });
@@ -661,6 +730,14 @@ app.delete('/api/issues/:id', authenticateToken, async (req, res) => {
 
         if (!isAdmin && !isOwner) {
             return res.status(403).json({ message: 'Access denied' });
+        }
+
+        // Check if blocked (for Citizen owner)
+        if (isOwner && !isAdmin) {
+            const currentUser = await db.collection('users').findOne({ _id: new ObjectId(req.user.userId) });
+            if (currentUser?.isBlocked) {
+                return res.status(403).json({ message: 'Your account is blocked.' });
+            }
         }
 
         // Citizens can only delete pending issues
@@ -735,28 +812,24 @@ app.patch('/api/users/:id', authenticateToken, authorizeRole('admin'), async (re
 // ============ DASHBOARD STATS ============
 
 // Get dashboard statistics
-app.get('/api/stats', authenticateToken, authorizeRole('admin', 'staff'), async (req, res) => {
+app.get('/api/stats', authenticateToken, async (req, res) => {
     try {
         if (!dbConnected) {
             return res.status(503).json({ message: 'Database not connected' });
         }
 
-        const totalIssues = await db.collection('issues').countDocuments();
-        const pendingIssues = await db.collection('issues').countDocuments({ status: 'pending' });
-        const inProgressIssues = await db.collection('issues').countDocuments({ status: 'in-progress' });
-        const resolvedIssues = await db.collection('issues').countDocuments({ status: 'resolved' });
-        const closedIssues = await db.collection('issues').countDocuments({ status: 'closed' });
+        const filter = {};
+        if (req.user.role === 'citizen') {
+            filter.citizenId = new ObjectId(req.user.userId);
+        }
 
-        const totalUsers = await db.collection('users').countDocuments();
-        const premiumUsers = await db.collection('users').countDocuments({ isPremium: true });
-        const staffCount = await db.collection('users').countDocuments({ role: 'staff' });
+        const totalIssues = await db.collection('issues').countDocuments(filter);
+        const pendingIssues = await db.collection('issues').countDocuments({ ...filter, status: 'pending' });
+        const inProgressIssues = await db.collection('issues').countDocuments({ ...filter, status: 'in-progress' });
+        const resolvedIssues = await db.collection('issues').countDocuments({ ...filter, status: 'resolved' });
+        const closedIssues = await db.collection('issues').countDocuments({ ...filter, status: 'closed' });
 
-        // Issue breakdown by category
-        const categoryStats = await db.collection('issues').aggregate([
-            { $group: { _id: '$category', count: { $sum: 1 } } }
-        ]).toArray();
-
-        res.json({
+        let stats = {
             issues: {
                 total: totalIssues,
                 pending: pendingIssues,
@@ -764,13 +837,51 @@ app.get('/api/stats', authenticateToken, authorizeRole('admin', 'staff'), async 
                 resolved: resolvedIssues,
                 closed: closedIssues
             },
-            users: {
+            totalPayments: req.user.isPremium ? 1000 : 0
+        };
+
+        if (req.user.role === 'staff') {
+            // Staff sees stats for their assigned issues
+            const staffId = req.user.userId;
+            const totalAssigned = await db.collection('issues').countDocuments({ assignedTo: staffId });
+            const workingIssues = await db.collection('issues').countDocuments({ assignedTo: staffId, status: 'working' });
+            const inProgressIssues = await db.collection('issues').countDocuments({ assignedTo: staffId, status: 'in-progress' });
+            const resolvedIssues = await db.collection('issues').countDocuments({ assignedTo: staffId, status: 'resolved' });
+
+            // Today's tasks (updated or assigned today)
+            const startOfDay = new Date();
+            startOfDay.setHours(0, 0, 0, 0);
+            const todaysTasks = await db.collection('issues').countDocuments({
+                assignedTo: staffId,
+                updatedAt: { $gte: startOfDay }
+            });
+
+            stats.issues = {
+                total: totalAssigned,
+                working: workingIssues,
+                inProgress: inProgressIssues,
+                resolved: resolvedIssues,
+                today: todaysTasks
+            };
+        } else if (req.user.role === 'admin') {
+            const totalUsers = await db.collection('users').countDocuments();
+            const premiumUsers = await db.collection('users').countDocuments({ isPremium: true });
+            const staffCount = await db.collection('users').countDocuments({ role: 'staff' });
+
+            // Issue breakdown by category for admin
+            const categoryStats = await db.collection('issues').aggregate([
+                { $group: { _id: '$category', count: { $sum: 1 } } }
+            ]).toArray();
+
+            stats.users = {
                 total: totalUsers,
                 premium: premiumUsers,
                 staff: staffCount
-            },
-            categoryBreakdown: categoryStats
-        });
+            };
+            stats.categoryBreakdown = categoryStats;
+        }
+
+        res.json(stats);
     } catch (error) {
         console.error('Stats error:', error);
         res.status(500).json({ message: 'Server error' });
