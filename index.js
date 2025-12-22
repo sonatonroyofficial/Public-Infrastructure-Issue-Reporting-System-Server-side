@@ -284,31 +284,36 @@ app.post('/api/issues', authenticateToken, authorizeRole('citizen'), async (req,
 });
 
 // Get all issues (with filtering)
-app.get('/api/issues', authenticateToken, async (req, res) => {
+app.get('/api/issues', async (req, res) => {
     try {
         if (!dbConnected) {
             return res.status(503).json({ message: 'Database not connected' });
         }
 
-        const { status, category, priority, citizenId } = req.query;
+        const { status, category, priority, citizenId, search } = req.query;
         const filter = {};
-
-        // Citizens can only see their own issues
-        if (req.user.role === 'citizen') {
-            filter.citizenId = new ObjectId(req.user.userId);
-        }
 
         // Apply filters
         if (status) filter.status = status;
         if (category) filter.category = category;
         if (priority) filter.priority = priority;
-        if (citizenId && req.user.role !== 'citizen') {
+        if (citizenId) {
             filter.citizenId = new ObjectId(citizenId);
+        }
+
+        // Search functionality
+        if (search) {
+            filter.$or = [
+                { title: { $regex: search, $options: 'i' } },
+                { description: { $regex: search, $options: 'i' } },
+                { category: { $regex: search, $options: 'i' } },
+                { 'location.address': { $regex: search, $options: 'i' } }
+            ];
         }
 
         const issues = await db.collection('issues')
             .find(filter)
-            .sort({ isPremiumIssue: -1, createdAt: -1 })
+            .sort({ isPremiumIssue: -1, upvotes: -1, createdAt: -1 })
             .toArray();
 
         res.json({ issues });
@@ -319,7 +324,7 @@ app.get('/api/issues', authenticateToken, async (req, res) => {
 });
 
 // Get single issue by ID
-app.get('/api/issues/:id', authenticateToken, async (req, res) => {
+app.get('/api/issues/:id', async (req, res) => {
     try {
         if (!dbConnected) {
             return res.status(503).json({ message: 'Database not connected' });
@@ -331,14 +336,52 @@ app.get('/api/issues/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ message: 'Issue not found' });
         }
 
-        // Citizens can only view their own issues
-        if (req.user.role === 'citizen' && issue.citizenId.toString() !== req.user.userId) {
-            return res.status(403).json({ message: 'Access denied' });
-        }
-
         res.json({ issue });
     } catch (error) {
         console.error('Issue fetch error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Upvote an issue
+app.put('/api/issues/:id/upvote', authenticateToken, async (req, res) => {
+    try {
+        if (!dbConnected) {
+            return res.status(503).json({ message: 'Database not connected' });
+        }
+
+        const issueId = req.params.id;
+        const userId = req.user.userId;
+
+        const issue = await db.collection('issues').findOne({ _id: new ObjectId(issueId) });
+
+        if (!issue) {
+            return res.status(404).json({ message: 'Issue not found' });
+        }
+
+        // Users cannot upvote their own issue
+        if (issue.citizenId.toString() === userId) {
+            return res.status(403).json({ message: 'You cannot upvote your own issue' });
+        }
+
+        // Check if already upvoted
+        if (issue.upvotedBy && issue.upvotedBy.includes(userId)) {
+            return res.status(400).json({ message: 'You have already upvoted this issue' });
+        }
+
+        const result = await db.collection('issues').updateOne(
+            { _id: new ObjectId(issueId) },
+            {
+                $inc: { upvotes: 1 },
+                $push: { upvotedBy: userId },
+                $set: { updatedAt: new Date() }
+            }
+        );
+
+        res.json({ message: 'Upvoted successfully', upvotes: (issue.upvotes || 0) + 1 });
+
+    } catch (error) {
+        console.error('Upvote error:', error);
         res.status(500).json({ message: 'Server error' });
     }
 });
