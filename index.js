@@ -269,8 +269,9 @@ app.post('/api/issues', authenticateToken, authorizeRole('citizen'), async (req,
                 {
                     status: 'pending',
                     updatedBy: req.user.email,
+                    updatedByRole: 'citizen',
                     timestamp: new Date(),
-                    comment: 'Issue reported'
+                    comment: 'Issue reported by citizen'
                 }
             ],
             createdAt: new Date(),
@@ -434,8 +435,9 @@ app.patch('/api/issues/:id/assign', authenticateToken, authorizeRole('admin'), a
                     statusHistory: {
                         status: 'assigned',
                         updatedBy: req.user.email,
+                        updatedByRole: req.user.role,
                         timestamp: new Date(),
-                        comment: `Assigned to ${staff.name}`
+                        comment: `Issue assigned to Staff: ${staff.name}`
                     }
                 }
             }
@@ -488,6 +490,7 @@ app.patch('/api/issues/:id/status', authenticateToken, authorizeRole('staff', 'a
                     statusHistory: {
                         status,
                         updatedBy: req.user.email,
+                        updatedByRole: req.user.role,
                         timestamp: new Date(),
                         comment: comment || `Status updated to ${status}`
                     }
