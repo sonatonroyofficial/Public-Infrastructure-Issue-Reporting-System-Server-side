@@ -231,6 +231,36 @@ app.get('/api/auth/profile', authenticateToken, async (req, res) => {
     }
 });
 
+// Update current user profile
+app.patch('/api/auth/profile', authenticateToken, async (req, res) => {
+    try {
+        if (!dbConnected) {
+            return res.status(503).json({ message: 'Database not connected' });
+        }
+
+        const { name, phone, address } = req.body;
+        const updateFields = { updatedAt: new Date() };
+
+        if (name) updateFields.name = name;
+        if (phone) updateFields.phone = phone;
+        if (address) updateFields.address = address;
+
+        const result = await db.collection('users').updateOne(
+            { _id: new ObjectId(req.user.userId) },
+            { $set: updateFields }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        res.json({ message: 'Profile updated successfully' });
+    } catch (error) {
+        console.error('Profile update error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
 // ============ ISSUE ROUTES ============
 
 // Create new issue (Citizens only)
@@ -563,18 +593,82 @@ app.post('/api/issues/:id/comments', authenticateToken, async (req, res) => {
     }
 });
 
-// Delete issue (Admin only)
-app.delete('/api/issues/:id', authenticateToken, authorizeRole('admin'), async (req, res) => {
+
+
+// Update issue details (Citizen only, if pending)
+app.put('/api/issues/:id', authenticateToken, authorizeRole('citizen'), async (req, res) => {
     try {
         if (!dbConnected) {
             return res.status(503).json({ message: 'Database not connected' });
         }
 
-        const result = await db.collection('issues').deleteOne({ _id: new ObjectId(req.params.id) });
+        const { title, description, category, location, photos } = req.body;
 
-        if (result.deletedCount === 0) {
+        const issue = await db.collection('issues').findOne({ _id: new ObjectId(req.params.id) });
+
+        if (!issue) {
             return res.status(404).json({ message: 'Issue not found' });
         }
+
+        // Verify ownership
+        if (issue.citizenId.toString() !== req.user.userId) {
+            return res.status(403).json({ message: 'You can only edit your own issues' });
+        }
+
+        // Verify status
+        if (issue.status !== 'pending') {
+            return res.status(400).json({ message: 'You can only edit pending issues' });
+        }
+
+        const updateFields = {
+            updatedAt: new Date()
+        };
+
+        if (title) updateFields.title = title;
+        if (description) updateFields.description = description;
+        if (category) updateFields.category = category;
+        if (location) updateFields.location = location;
+        if (photos) updateFields.photos = photos;
+
+        await db.collection('issues').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: updateFields }
+        );
+
+        res.json({ message: 'Issue updated successfully' });
+    } catch (error) {
+        console.error('Issue update error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Delete issue
+app.delete('/api/issues/:id', authenticateToken, async (req, res) => {
+    try {
+        if (!dbConnected) {
+            return res.status(503).json({ message: 'Database not connected' });
+        }
+
+        const issue = await db.collection('issues').findOne({ _id: new ObjectId(req.params.id) });
+
+        if (!issue) {
+            return res.status(404).json({ message: 'Issue not found' });
+        }
+
+        // Check permissions
+        const isAdmin = req.user.role === 'admin';
+        const isOwner = issue.citizenId.toString() === req.user.userId;
+
+        if (!isAdmin && !isOwner) {
+            return res.status(403).json({ message: 'Access denied' });
+        }
+
+        // Citizens can only delete pending issues
+        if (isOwner && !isAdmin && issue.status !== 'pending') {
+            return res.status(400).json({ message: 'You can only delete pending issues' });
+        }
+
+        const result = await db.collection('issues').deleteOne({ _id: new ObjectId(req.params.id) });
 
         res.json({ message: 'Issue deleted successfully' });
     } catch (error) {
@@ -679,6 +773,27 @@ app.get('/api/stats', authenticateToken, authorizeRole('admin', 'staff'), async 
         });
     } catch (error) {
         console.error('Stats error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Get payments (Admin only)
+app.get('/api/payments', authenticateToken, authorizeRole('admin'), async (req, res) => {
+    try {
+        if (!dbConnected) {
+            return res.status(503).json({ message: 'Database not connected' });
+        }
+
+        // Mock payment data since we don't have a real payment gateway integrated yet
+        // In a real app, this would query a 'payments' collection
+        const payments = [
+            { id: 1, user: 'John Doe', amount: 50, type: 'Subscription', date: new Date(), status: 'Completed' },
+            { id: 2, user: 'Jane Smith', amount: 10, type: 'Boost', date: new Date(Date.now() - 86400000), status: 'Completed' },
+        ];
+
+        res.json({ payments });
+    } catch (error) {
+        console.error('Payments error:', error);
         res.status(500).json({ message: 'Server error' });
     }
 });
