@@ -2,10 +2,38 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { MongoClient, ObjectId, ServerApiVersion } from 'mongodb';
-import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
+import admin from 'firebase-admin';
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+// Firebase Admin Setup
+const serviceAccountKey = process.env.FIREBASE_SERVICE_ACCOUNT;
+let serviceAccount;
+
+if (serviceAccountKey) {
+    try {
+        serviceAccount = JSON.parse(serviceAccountKey);
+    } catch (error) {
+        console.error("Error parsing FIREBASE_SERVICE_ACCOUNT:", error);
+    }
+} else {
+    try {
+        serviceAccount = require("./public-infrastrure-system-firebase-adminsdk.json");
+    } catch (error) {
+        console.warn("Firebase service account file not found.");
+    }
+}
 
 dotenv.config();
+
+if (serviceAccount) {
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+} else {
+    console.warn("Firebase Auth initialized without credentials (might fail in production)");
+}
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -36,16 +64,19 @@ async function connectToDatabase() {
         // Connect the client to the server
         await client.connect();
         // Send a ping to confirm a successful connection
-        await client.db("admin").command({ ping: 1 });
+        // await client.db("admin").command({ ping: 1 });
 
         db = client.db('infrastructure_reporting');
         dbConnected = true;
         console.log("Pinged your deployment. You successfully connected to MongoDB!");
 
+
         // Create indexes for better performance
         await db.collection('users').createIndex({ email: 1 }, { unique: true });
         await db.collection('issues').createIndex({ status: 1 });
         await db.collection('issues').createIndex({ citizenId: 1 });
+
+        await seedUsers();
 
     } catch (error) {
         console.error('❌ MongoDB connection error:', error);
@@ -54,6 +85,64 @@ async function connectToDatabase() {
         setTimeout(connectToDatabase, 5000);
     }
 }
+
+const seedUsers = async () => {
+    try {
+        const staffPassword = await bcrypt.hash('staff123', 10);
+        await db.collection('users').updateOne(
+            { email: 'staff@gmail.com' },
+            {
+                $set: {
+                    name: 'Default Staff',
+                    email: 'staff@gmail.com',
+                    password: staffPassword,
+                    role: 'staff',
+                    createdAt: new Date(),
+                    isBlocked: false
+                }
+            },
+            { upsert: true }
+        );
+        console.log("✅ Seeded Staff User: staff@gmail.com");
+
+        const citizenPassword = await bcrypt.hash('citizen123', 10);
+        await db.collection('users').updateOne(
+            { email: 'citizen@gmail.com' },
+            {
+                $set: {
+                    name: 'Default Citizen',
+                    email: 'citizen@gmail.com',
+                    password: citizenPassword,
+                    role: 'citizen',
+                    createdAt: new Date(),
+                    isBlocked: false
+                }
+            },
+            { upsert: true }
+        );
+        console.log("✅ Seeded Citizen User: citizen@gmail.com");
+
+        const adminPassword = await bcrypt.hash('sonaton123', 10);
+        await db.collection('users').updateOne(
+            { email: 'sonaton.fl@gmail.com' },
+            {
+                $set: {
+                    name: 'Sonaton Admin',
+                    email: 'sonaton.fl@gmail.com',
+                    password: adminPassword,
+                    role: 'admin',
+                    createdAt: new Date(),
+                    isBlocked: false
+                }
+            },
+            { upsert: true }
+        );
+        console.log("✅ Seeded Admin User: sonaton.fl@gmail.com");
+
+    } catch (error) {
+        console.error("Error seeding users:", error);
+    }
+};
 
 connectToDatabase();
 
@@ -94,7 +183,7 @@ app.post('/api/auth/register', async (req, res) => {
             return res.status(503).json({ message: 'Database not connected' });
         }
 
-        const { name, email, password, phone, address, role = 'citizen', isPremium = false } = req.body;
+        const { name, email, password, phone, address, isPremium = false, photo } = req.body;
 
         // Validate input
         if (!name || !email || !password) {
@@ -117,9 +206,10 @@ app.post('/api/auth/register', async (req, res) => {
             password: hashedPassword,
             phone: phone || '',
             address: address || '',
-            role, // citizen, staff, admin
-            isPremium: role === 'citizen' ? isPremium : false,
+            role: 'citizen', // Enforce citizen role for public registration
+            isPremium: isPremium,
             isBlocked: false,
+            photo: photo || null, // Store photo URL/Base64
             createdAt: new Date(),
             updatedAt: new Date()
         };
@@ -356,7 +446,7 @@ app.get('/api/issues', async (req, res) => {
             return res.status(503).json({ message: 'Database not connected' });
         }
 
-        const { status, category, priority, citizenId, search } = req.query;
+        const { status, category, priority, citizenId, search, page = 1, limit = 10 } = req.query;
         const filter = {};
 
         // Apply filters
@@ -377,12 +467,29 @@ app.get('/api/issues', async (req, res) => {
             ];
         }
 
+        const pageNum = parseInt(page);
+        const limitNum = parseInt(limit);
+        const skip = (pageNum - 1) * limitNum;
+
+        const totalIssues = await db.collection('issues').countDocuments(filter);
+        const totalPages = Math.ceil(totalIssues / limitNum);
+
         const issues = await db.collection('issues')
             .find(filter)
             .sort({ isPremiumIssue: -1, upvotes: -1, createdAt: -1 })
+            .skip(skip)
+            .limit(limitNum)
             .toArray();
 
-        res.json({ issues });
+        res.json({
+            issues,
+            pagination: {
+                totalIssues,
+                totalPages,
+                currentPage: pageNum,
+                limit: limitNum
+            }
+        });
     } catch (error) {
         console.error('Issue fetch error:', error);
         res.status(500).json({ message: 'Server error while fetching issues' });
@@ -588,28 +695,118 @@ app.patch('/api/issues/:id/status', authenticateToken, authorizeRole('staff', 'a
             return res.status(403).json({ message: 'You can only update issues assigned to you' });
         }
 
-        const result = await db.collection('issues').updateOne(
-            { _id: new ObjectId(req.params.id) },
-            {
-                $set: {
+        // If status is changing to 'rejected', ensure it was pending
+        if (status === 'rejected' && issue.status !== 'pending') {
+            return res.status(400).json({ message: 'Can only reject pending issues' });
+        }
+
+        const updateDoc = {
+            $set: { status, updatedAt: new Date() },
+            $push: {
+                statusHistory: {
                     status,
-                    updatedAt: new Date()
-                },
-                $push: {
-                    statusHistory: {
-                        status,
-                        updatedBy: req.user.email,
-                        updatedByRole: req.user.role,
-                        timestamp: new Date(),
-                        comment: comment || `Status updated to ${status}`
-                    }
+                    changedBy: req.user.userId,
+                    changedByName: req.user.name, // Ideally fetch name
+                    comment: comment || `Status updated to ${status}`,
+                    date: new Date()
                 }
             }
+        };
+
+        await db.collection('issues').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            updateDoc
         );
 
-        res.json({ message: 'Issue status updated successfully' });
+        res.json({ message: 'Issue status updated' });
     } catch (error) {
         console.error('Status update error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Assign Staff to Issue
+app.put('/api/issues/:id/assign', authenticateToken, authorizeRole('admin'), async (req, res) => {
+    try {
+        if (!dbConnected) return res.status(503).json({ message: 'Database not connected' });
+
+        const { staffId } = req.body;
+        if (!staffId) return res.status(400).json({ message: 'Staff ID is required' });
+
+        const staff = await db.collection('users').findOne({ _id: new ObjectId(staffId), role: 'staff' });
+        if (!staff) return res.status(404).json({ message: 'Staff member not found' });
+
+        const issue = await db.collection('issues').findOne({ _id: new ObjectId(req.params.id) });
+        if (!issue) return res.status(404).json({ message: 'Issue not found' });
+
+        // Check if already assigned
+        if (issue.assignedTo) {
+            return res.status(400).json({ message: 'Issue is already assigned' });
+        }
+
+        const updateDoc = {
+            $set: {
+                assignedTo: staffId.toString(),
+                assignedStaffName: staff.name,
+                status: 'assigned', // Workflow: Pending -> Assigned -> In Progress
+                updatedAt: new Date()
+            },
+            $push: {
+                statusHistory: {
+                    status: 'assigned',
+                    changedBy: req.user.userId,
+                    changedByName: req.user.name,
+                    comment: `Assigned to staff: ${staff.name}`,
+                    date: new Date()
+                }
+            }
+        };
+
+        await db.collection('issues').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            updateDoc
+        );
+
+        res.json({ message: `Issue assigned to ${staff.name}` });
+    } catch (error) {
+        console.error('Assign issue error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Reject Issue
+app.put('/api/issues/:id/reject', authenticateToken, authorizeRole('admin'), async (req, res) => {
+    try {
+        if (!dbConnected) return res.status(503).json({ message: 'Database not connected' });
+
+        const issue = await db.collection('issues').findOne({ _id: new ObjectId(req.params.id) });
+        if (!issue) return res.status(404).json({ message: 'Issue not found' });
+
+        if (issue.status !== 'pending') {
+            return res.status(400).json({ message: 'Only pending issues can be rejected' });
+        }
+
+        const updateDoc = {
+            $set: { status: 'rejected', updatedAt: new Date() },
+            $push: {
+                statusHistory: {
+                    status: 'rejected',
+                    changedBy: req.user.userId,
+                    changedByName: req.user.name,
+                    comment: 'Issue rejected by admin',
+                    date: new Date()
+                }
+            }
+        };
+
+        await db.collection('issues').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            updateDoc
+        );
+
+        res.json({ message: 'Issue rejected successfully' });
+    } catch (error) {
+        console.error('Reject issue error:', error);
         res.status(500).json({ message: 'Server error' });
     }
 });
@@ -780,18 +977,61 @@ app.get('/api/users', authenticateToken, authorizeRole('admin'), async (req, res
     }
 });
 
-// Update user role or premium status (Admin only)
+// Create new staff member (Admin only)
+app.post('/api/staff', authenticateToken, authorizeRole('admin'), async (req, res) => {
+    try {
+        if (!dbConnected) return res.status(503).json({ message: 'Database not connected' });
+
+        const { name, email, password, phone, address } = req.body;
+
+        // 1. Create user in Firebase Authentication
+        let firebaseUser;
+        try {
+            firebaseUser = await admin.auth().createUser({
+                email,
+                password,
+                displayName: name,
+            });
+        } catch (firebaseError) {
+            console.error('Firebase creation error:', firebaseError);
+            return res.status(400).json({ message: 'Error creating user in Firebase: ' + firebaseError.message });
+        }
+
+        // 2. Create user in MongoDB
+        const newUser = {
+            name,
+            email,
+            role: 'staff', // Enforce staff role
+            phone,
+            address,
+            firebaseUid: firebaseUser.uid,
+            isPremium: false,
+            isBlocked: false,
+            createdAt: new Date()
+        };
+
+        const result = await db.collection('users').insertOne(newUser);
+
+        res.status(201).json({ message: 'Staff created successfully', userId: result.insertedId });
+    } catch (error) {
+        console.error('Create staff error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Update user role, premium status, or blocked status (Admin only)
 app.patch('/api/users/:id', authenticateToken, authorizeRole('admin'), async (req, res) => {
     try {
         if (!dbConnected) {
             return res.status(503).json({ message: 'Database not connected' });
         }
 
-        const { role, isPremium } = req.body;
+        const { role, isPremium, isBlocked } = req.body;
         const updateFields = { updatedAt: new Date() };
 
         if (role) updateFields.role = role;
         if (isPremium !== undefined) updateFields.isPremium = isPremium;
+        if (isBlocked !== undefined) updateFields.isBlocked = isBlocked;
 
         const result = await db.collection('users').updateOne(
             { _id: new ObjectId(req.params.id) },
@@ -805,6 +1045,50 @@ app.patch('/api/users/:id', authenticateToken, authorizeRole('admin'), async (re
         res.json({ message: 'User updated successfully' });
     } catch (error) {
         console.error('User update error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Block/Unblock user (Admin only)
+app.patch('/api/users/:id/block', authenticateToken, authorizeRole('admin'), async (req, res) => {
+    try {
+        if (!dbConnected) {
+            return res.status(503).json({ message: 'Database not connected' });
+        }
+
+        const { isBlocked } = req.body;
+
+        if (typeof isBlocked !== 'boolean') {
+            return res.status(400).json({ message: 'isBlocked must be a boolean' });
+        }
+
+        const result = await db.collection('users').updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { isBlocked: isBlocked, updatedAt: new Date() } }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        res.json({ message: `User ${isBlocked ? 'blocked' : 'unblocked'} successfully` });
+    } catch (error) {
+        console.error('Block/unblock user error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Delete user (Admin only)
+app.delete('/api/users/:id', authenticateToken, authorizeRole('admin'), async (req, res) => {
+    try {
+        if (!dbConnected) return res.status(503).json({ message: 'Database not connected' });
+
+        const result = await db.collection('users').deleteOne({ _id: new ObjectId(req.params.id) });
+        if (result.deletedCount === 0) return res.status(404).json({ message: 'User not found' });
+
+        res.json({ message: 'User deleted successfully' });
+    } catch (error) {
+        console.error('Delete user error:', error);
         res.status(500).json({ message: 'Server error' });
     }
 });
@@ -868,16 +1152,25 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
             const premiumUsers = await db.collection('users').countDocuments({ isPremium: true });
             const staffCount = await db.collection('users').countDocuments({ role: 'staff' });
 
-            // Issue breakdown by category for admin
+            // Rejected
+            const rejectedIssues = await db.collection('issues').countDocuments({ status: 'rejected' });
+
+            // Total Payments (Sum of subscriptions) - simplistic
+            // In real app, aggregate payments collection. Here we count premium users * 1000
+            const totalRevenue = premiumUsers * 1000;
+
+            // Issue breakdown
             const categoryStats = await db.collection('issues').aggregate([
                 { $group: { _id: '$category', count: { $sum: 1 } } }
             ]).toArray();
 
+            stats.issues.rejected = rejectedIssues;
             stats.users = {
                 total: totalUsers,
                 premium: premiumUsers,
                 staff: staffCount
             };
+            stats.revenue = totalRevenue;
             stats.categoryBreakdown = categoryStats;
         }
 
@@ -909,6 +1202,37 @@ app.get('/api/payments', authenticateToken, authorizeRole('admin'), async (req, 
     }
 });
 
+// Contact Form Submission
+app.post('/api/contact', async (req, res) => {
+    try {
+        if (!dbConnected) {
+            return res.status(503).json({ message: 'Database not connected' });
+        }
+
+        const { name, email, subject, message } = req.body;
+
+        if (!name || !email || !message) {
+            return res.status(400).json({ message: 'Name, email, and message are required' });
+        }
+
+        const newMessage = {
+            name,
+            email,
+            subject,
+            message,
+            status: 'unread',
+            createdAt: new Date()
+        };
+
+        await db.collection('messages').insertOne(newMessage);
+
+        res.status(201).json({ message: 'Message sent successfully' });
+    } catch (error) {
+        console.error('Contact error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
     res.json({
@@ -928,10 +1252,15 @@ app.get('/', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📍 API: http://localhost:${PORT}`);
-});
+// Start server only if not running on Vercel
+if (process.env.VERCEL !== '1') {
+    app.listen(PORT, () => {
+        console.log(`🚀 Server running on port ${PORT}`);
+        console.log(`📍 API: http://localhost:${PORT}`);
+    });
+}
+
+export default app;
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
