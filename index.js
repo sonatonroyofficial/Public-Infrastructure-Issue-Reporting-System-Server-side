@@ -303,6 +303,73 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+// Google Login
+app.post('/api/auth/google', async (req, res) => {
+    try {
+        const { token } = req.body;
+        if (!token) return res.status(400).json({ message: 'Token required' });
+
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        const { email, name, picture, uid } = decodedToken;
+
+        let user = await db.collection('users').findOne({ email });
+
+        if (!user) {
+            // Register new citizen
+            const newUser = {
+                name: name || 'Google User',
+                email,
+                password: '', // No password for Google users
+                role: 'citizen',
+                isPremium: false,
+                isBlocked: false,
+                photo: picture || null,
+                googleId: uid,
+                createdAt: new Date(),
+                updatedAt: new Date()
+            };
+            const result = await db.collection('users').insertOne(newUser);
+            user = { ...newUser, _id: result.insertedId };
+        } else {
+            // Update googleId if missing
+            if (!user.googleId) {
+                await db.collection('users').updateOne({ _id: user._id }, { $set: { googleId: uid, photo: picture || user.photo } });
+            }
+        }
+
+        if (user.isBlocked) {
+            return res.status(403).json({ message: 'Account is blocked' });
+        }
+
+        const jwtToken = jwt.sign(
+            {
+                userId: user._id.toString(),
+                email: user.email,
+                role: user.role,
+                isPremium: user.isPremium
+            },
+            JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+
+        res.json({
+            message: 'Login successful',
+            token: jwtToken,
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                role: user.role,
+                isPremium: user.isPremium
+            }
+        });
+
+    } catch (error) {
+        console.error('Google Auth Error:', error);
+        res.status(401).json({ message: 'Invalid token' });
+    }
+});
+
 // Get current user profile
 app.get('/api/auth/profile', authenticateToken, async (req, res) => {
     try {
